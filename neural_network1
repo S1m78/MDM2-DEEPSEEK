@@ -1,0 +1,28 @@
+import torch.nn as nn
+import torch as t
+import matplotlib.pyplot as plt
+t.manual_seed(1) #Fix the random seed, so we always generate the same data.
+
+N = 100
+x_class_0 = 0.5*t.randn(N//2, 2) - 1
+x_class_1 = t.randn(N//2, 2) + 1
+X = t.cat([x_class_0, x_class_1], 0)
+y = t.cat([t.zeros(N//2, 1), t.ones(N//2, 1)], 0)
+
+plt.scatter(x=X[:, 0], y=X[:, 1], c=y)
+plt.xlabel('$x_1$')
+plt.ylabel('$x_2$')
+
+def loss(l):
+    return -(y*t.nn.functional.logsigmoid(l) + (1-y)*t.nn.functional.logsigmoid(-l)).sum()
+
+# Define the shape of the network
+input_features = 2
+hidden_features = 100
+output_features = 1
+
+torch_nn_net = nn.Sequential(
+    nn.Linear(input_features, hidden_features),
+    nn.ReLU(),
+    nn.Linear(hidden_features, output_features)
+)
