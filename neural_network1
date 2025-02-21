@@ -1,9 +1,9 @@
 import torch.nn as nn
 import torch as t
 import matplotlib.pyplot as plt
-t.manual_seed(1) #Fix the random seed, so we always generate the same data.
+t.manual_seed(42) #Fix the random seed, so we always generate the same data.
 
-N = 100
+N = 200
 x_class_0 = 0.5*t.randn(N//2, 2) - 1
 x_class_1 = t.randn(N//2, 2) + 1
 X = t.cat([x_class_0, x_class_1], 0)
@@ -12,6 +12,7 @@ y = t.cat([t.zeros(N//2, 1), t.ones(N//2, 1)], 0)
 plt.scatter(x=X[:, 0], y=X[:, 1], c=y)
 plt.xlabel('$x_1$')
 plt.ylabel('$x_2$')
+
 
 def loss(l):
     return -(y*t.nn.functional.logsigmoid(l) + (1-y)*t.nn.functional.logsigmoid(-l)).sum()
@@ -25,4 +26,119 @@ torch_nn_net = nn.Sequential(
     nn.Linear(input_features, hidden_features),
     nn.ReLU(),
     nn.Linear(hidden_features, output_features)
-)
+) 
+
+def poisson_equation_update(phi, m_x, g, dx2, num_iter=50):
+    """
+    Poisson equation from Andrew 
+    A finite difference equation derived from the Poisson equation and is commonly
+    used in iterative numerical solvers for differential equations
+
+    Inputs:
+        phi: Tensor of neuron activity states.
+        m_x: Tensor representing the mass function m(x).
+        g: Gravitational or scaling factor.
+        dx2: Squared step size (Δx^2).
+        num_iter: Number of relaxation steps.
+
+    Returns:
+        Updated phi values after relaxation.
+    """
+    for i in range(num_iter):
+        phi = ((phi.roll(1) + phi.roll(-1)) / 2) - (m_x * g * dx2) / 2  # The .roll part cumputes the sum of each positions neighbours
+    return phi
+
+def train_pure_energy(network, X, y, m_x, g=0.1, dx2=0.01,
+                      num_train_iter=20, relax_iter=25, alpha=0.001, grad_clip=5.0):
+    """
+    Trains the network using a pure energy minimization approach.
+    The input and output are treated as fixed (supports):
+      - Hidden layer activations are allowed to relax via Poisson relaxation.
+      - The output is clamped to the target.
+    Weight and bias updates are computed solely from the differences between
+    the relaxed and actual activations.
+    
+    grad_clip: maximum allowed norm for the gradient (to prevent explosion).
+    """
+    # Extract parameters for the layers
+    W1 = network[0].weight.data       #The first layer weights, linear.nn
+    b1 = network[0].bias.data        # First layer bias
+    W2 = network[2].weight.data      # Output layer
+    b2 = network[2].bias.data
+    
+    for epoch in range(num_train_iter):
+        # The forward pass computes activations as in normal neural networks. However, instead of using gradients, we now update neuron states using Poisson relaxation.
+        hidden = t.relu(X @ W1.T + b1) # matrix mult with the weights then add bias. Then relu adds non-linearity.
+        logits = hidden @ W2.T + b2      # Logits are the raw (unnormalized ) outputs of the final layer of a neural network before applying an activation function.
+    
+        
+        # Energy minimization: let the hidden layer relax
+        phi_hidden = hidden.clone().detach() # We create a copy of the current hidden activations
+        # This process simulates the physical relaxation where neighboring neuron states interact
+        phi_hidden = poisson_equation_update(phi_hidden, m_x, g, dx2, num_iter=relax_iter) 
+        
+        # Clamp output: the supports remain fixed (targets)
+        # This clamping means that during energy minimization, the output should remain at the target value, and only the hidden layer is allowed to adjust.
+        phi_output = y.clone().detach()
+        
+
+        # We compute the difference (phi_hidden - hidden) between the relaxed state and the actual forward activations. This difference represents the “error” or tension in the system.
+        # Multiplying by (hidden > 0) ensures that only neurons that are active (i.e., with a positive activation) contribute. This is in line with the ReLU function, which only passes forward non-negative values.
+
+        grad_W1 = ((phi_hidden - hidden) * (hidden > 0)).T @ X  
+        grad_b1 = ((phi_hidden - hidden) * (hidden > 0)).sum(dim=0)  
+        
+        #The masked difference is transposed and then multiplied by the input X to form the gradient for the first layer’s weights.
+        grad_W2 = (hidden.T @ (phi_output - logits)).T  
+        # For biases, the gradient is simply the sum of the masked differences over all samples (summing along the batch dimension).     
+        grad_b2 = (phi_output - logits).sum(dim=0)                
+        
+    #Clipping is applied to ensure that no gradient value exceeds the threshold (grad_clip), which helps prevent numerical instability or “exploding gradients.”
+    # Otherwise get lots of Nan values
+        grad_W1 = t.clamp(grad_W1, -grad_clip, grad_clip)
+        grad_b1 = t.clamp(grad_b1, -grad_clip, grad_clip)
+        grad_W2 = t.clamp(grad_W2, -grad_clip, grad_clip)
+        grad_b2 = t.clamp(grad_b2, -grad_clip, grad_clip)
+
+        # Update weights and biases using a small learning rate
+        #This update step attempts to reduce the energy (or tension) in the system by moving the network’s parameters in the direction that minimizes the difference between the relaxed states and the current activations
+        W1 -= alpha * grad_W1
+        b1 -= alpha * grad_b1
+        W2 -= alpha * grad_W2
+        b2 -= alpha * grad_b2
+        
+        # Compute an energy measure (squared error at output)
+        if epoch % 10 == 0:
+            energy = ((phi_output - logits) ** 2).sum().item()
+            print(f"Epoch {epoch}, Energy: {energy:.4f}")
+    
+    return network
+
+# Train the network using pure energy minimization.
+# m_x is set to ones so that all neurons have equal influence.
+trained_net = train_pure_energy(torch_nn_net, X, y, m_x=t.ones((X.shape[0], 1)))
+                        
+
+def plot_decision_boundary(network, X, y):
+    """
+    Plots the decision boundary of the trained network.
+    """
+    x0_grid, x1_grid = t.meshgrid(t.linspace(-4, 4, 1000),
+                                  t.linspace(-4, 4, 1000),
+                                  indexing="ij")
+    X_grid = t.stack([x0_grid, x1_grid], dim=-1).reshape(-1, 2)
+    
+    with t.no_grad():
+        hidden = t.relu(X_grid @ network[0].weight.T + network[0].bias)
+        logits = hidden @ network[2].weight.T + network[2].bias
+        probabilities = t.sigmoid(logits)
+        c_grid = (probabilities > 0.5).reshape(1000, 1000)
+    
+    plt.contour(x0_grid, x1_grid, c_grid, colors='k', linewidths=0.7)
+    plt.scatter(X[:, 0], X[:, 1], c=y)
+    plt.xlabel('$x_1$')
+    plt.ylabel('$x_2$')
+    plt.title("Decision Boundary with Energy Minimization")
+    plt.show()
+
+plot_decision_boundary(trained_net, X, y)
